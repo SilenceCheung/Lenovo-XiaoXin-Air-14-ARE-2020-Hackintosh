@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# Hackintosh GPU & System Safeguard Daemon v2.3
+# Comprehensive Protection for AMD APU (NootedRed) on macOS 15 Sequoia
+# 100% Non-invasive: Never modifies app bundle binaries to preserve Code Signing.
+# Automatically ensures system IPC daemons remain healthy and prevents 0ms spin loops.
+# ==============================================================================
+
+import os, sys, time, glob, plistlib, subprocess, shutil
+
+LOG_FILE = "/var/log/hackintosh-gpu-safeguard.log"
+
+def log(msg):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}\n"
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(line)
+    except:
+        pass
+
+def ensure_bluetoothd_healthy():
+    """Prevent catastrophic 350% CPU 0ms retry spin loop in ContextStoreAgent/tipsd/heard"""
+    disabled_plist = "/private/var/db/com.apple.xpc.launchd/disabled.plist"
+    try:
+        if os.path.exists(disabled_plist):
+            with open(disabled_plist, "rb") as f:
+                d = plistlib.load(f)
+            if "com.apple.bluetoothd" in d:
+                del d["com.apple.bluetoothd"]
+                with open(disabled_plist, "wb") as f:
+                    plistlib.dump(d, f)
+                log("AUTO-RECOVERED: Removed com.apple.bluetoothd from disabled.plist to prevent XPC spin loop.")
+        subprocess.run(["launchctl", "enable", "system/com.apple.bluetoothd"], check=False)
+        res = subprocess.run(["pgrep", "-x", "bluetoothd"], capture_output=True, text=True)
+        if not res.stdout.strip():
+            subprocess.run(["launchctl", "bootstrap", "system", "/System/Library/LaunchDaemons/com.apple.bluetoothd.plist"], check=False)
+            log("AUTO-STARTED: bootstraped system/com.apple.bluetoothd.")
+    except Exception as e:
+        log(f"bluetoothd health error: {e}")
+    garbage_collect_diagnostic_reports()
+
+def garbage_collect_diagnostic_reports():
+    """Autopilot GC: Purge old crash, spin, and stall reports older than 3 days to keep disk clean"""
+    diag_dirs = ["/Library/Logs/DiagnosticReports", os.path.expanduser("~/Library/Logs/DiagnosticReports")]
+    now = time.time()
+    for d in diag_dirs:
+        try:
+            if os.path.exists(d):
+                for f in os.listdir(d):
+                    fp = os.path.join(d, f)
+                    if os.path.isfile(fp):
+                        try:
+                            # ExcUserFault bluetooth reports: delete older than 5 mins
+                            if f.startswith("ExcUserFault_bluetoothd") and (now - os.stat(fp).st_mtime > 300):
+                                os.remove(fp)
+                            # All other crash, stall, spin reports: delete older than 3 days (259200s)
+                            elif (f.endswith(".ips") or f.endswith(".spin") or f.endswith(".diag") or f.endswith(".shutdownStall") or f.endswith(".gpuRestart")) and (now - os.stat(fp).st_mtime > 259200):
+                                os.remove(fp)
+                        except Exception:
+                            pass
+        except Exception as e:
+            log(f"diagnostic reports GC error on {d}: {e}")
+
+def rollback_any_orig():
+    """Safety rollback: ensure no .orig files linger in /Applications"""
+    for root, dirs, files in os.walk("/Applications"):
+        for f in files:
+            if f.endswith(".orig"):
+                orig_p = os.path.join(root, f)
+                dest_p = os.path.join(root, f[:-5])
+                try:
+                    shutil.move(orig_p, dest_p)
+                    log(f"RESTORED_ORIGINAL: {dest_p}")
+                except Exception as e:
+                    log(f"ERROR restoring {orig_p}: {e}")
+
+def purge_corrupted_icon_caches():
+    """Prevent iconservices store bloat and corruption from wedging GPU compute ring"""
+    store_path = "/Library/Caches/com.apple.iconservices.store"
+    try:
+        if os.path.isdir(store_path):
+            total_size = sum(os.path.getsize(os.path.join(dp, f)) for dp, dn, fn in os.walk(store_path) for f in fn)
+            if total_size > 150 * 1024 * 1024:  # Bloated > 150MB indicates retry loop
+                shutil.rmtree(store_path, ignore_errors=True)
+                log("AUTO-PURGED: Bloated /Library/Caches/com.apple.iconservices.store to protect GPU compute queue.")
+    except Exception as e:
+        log(f"Icon cache purge error: {e}")
+
+def get_user_home():
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and os.path.isdir(f"/Users/{sudo_user}"):
+        return f"/Users/{sudo_user}"
+    return os.path.expanduser("~")
+
+def purge_gpu_caches():
+    home = get_user_home()
+    target_dirs = [
+        os.path.join(home, "Library", "Application Support"),
+        os.path.join(home, ".workbuddy"),
+        os.path.join(home, "Library", "Caches")
+    ]
+    
+    purged = 0
+    for base in target_dirs:
+        if not os.path.isdir(base):
+            continue
+        for root, dirs, files in os.walk(base):
+            for d in list(dirs):
+                if d in ["DawnGraphiteCache", "DawnWebGPUCache", "GPUCache"]:
+                    target_path = os.path.join(root, d)
+                    try:
+                        shutil.rmtree(target_path, ignore_errors=True)
+                        purged += 1
+                    except:
+                        pass
+    if purged > 0:
+        log(f"Cleaned {purged} Dawn/WebGPU/GPUCache directories.")
+
+def immunize_bundle(bid, app_name):
+    if not bid or bid.startswith("com.apple."):
+        return False
+    
+    home = get_user_home()
+    pref_paths = [
+        f"/Library/Preferences/{bid}.plist",
+        os.path.join(home, "Library", "Preferences", f"{bid}.plist")
+    ]
+    
+    data = {
+        "HardwareAccelerationModeEnabled": False,
+        "CommandLineFlagSecurityWarningsEnabled": False,
+        "WebGPUEnabled": False
+    }
+    
+    updated = False
+    for plist_path in pref_paths:
+        try:
+            already = False
+            if os.path.exists(plist_path):
+                with open(plist_path, "rb") as f:
+                    p = plistlib.load(f)
+                    if p.get("HardwareAccelerationModeEnabled") is False and p.get("WebGPUEnabled") is False:
+                        already = True
+            if not already:
+                os.makedirs(os.path.dirname(plist_path), exist_ok=True)
+                with open(plist_path, "wb") as f:
+                    plistlib.dump(data, f)
+                os.chmod(plist_path, 0o644)
+                updated = True
+        except Exception as e:
+            log(f"ERROR immunizing {bid} in {plist_path}: {e}")
+            
+    if updated:
+        log(f"AUTO-IMMUNIZED BUNDLE: {app_name} ({bid})")
+    return updated
+
+def check_and_immunize_app(app_path):
+    if not os.path.isdir(app_path):
+        return
+    if "/System/" in app_path:
+        return
+        
+    # Non-invasive: Only inspect Info.plist to configure Preferences plist
+    for root, dirs, files in os.walk(app_path):
+        if "Info.plist" in files:
+            ip = os.path.join(root, "Info.plist")
+            try:
+                with open(ip, "rb") as f:
+                    p = plistlib.load(f)
+                bid = p.get("CFBundleIdentifier", "")
+                if bid and not bid.startswith("com.apple."):
+                    immunize_bundle(bid, os.path.basename(root))
+            except:
+                pass
+
+def check_and_hide_efi():
+    if os.path.exists("/Volumes/EFI"):
+        try:
+            res = subprocess.run(["pgrep", "-f", "sync_hackintosh"], capture_output=True, text=True)
+            if not res.stdout.strip():
+                res2 = subprocess.run(["pgrep", "-f", "mount_efi"], capture_output=True, text=True)
+                if not res2.stdout.strip():
+                    subprocess.run(["diskutil", "unmount", "/Volumes/EFI"], capture_output=True)
+                    log("AUTO-PROTECT: Detected mounted /Volumes/EFI, safely unmounted to prevent user misoperation.")
+        except Exception as e:
+            log(f"EFI protect error: {e}")
+
+def scan_all_apps():
+    search_dirs = [
+        "/Applications",
+        "/Users/*/Applications",
+        "/Users/*/Desktop",
+        "/Users/*/Downloads"
+    ]
+    for pattern in search_dirs:
+        for app in glob.glob(os.path.join(pattern, "*.app")):
+            check_and_immunize_app(app)
+
+def enforce_power_management():
+    """Ensure sleep 0, tcpkeepalive 1, displaysleep 15 to prevent sleep-wake WiFi disconnects and hangs"""
+    try:
+        subprocess.run(["pmset", "-a", "sleep", "0"], check=False)
+        subprocess.run(["pmset", "-a", "displaysleep", "15"], check=False)
+        subprocess.run(["pmset", "-a", "disksleep", "0"], check=False)
+        subprocess.run(["pmset", "-a", "tcpkeepalive", "1"], check=False)
+        subprocess.run(["pmset", "-a", "womp", "0"], check=False)
+        subprocess.run(["pmset", "-a", "powernap", "0"], check=False)
+        subprocess.run(["pmset", "-a", "proximitywake", "0"], check=False)
+        subprocess.run(["pmset", "-a", "hibernatemode", "0"], check=False)
+        log("AUTO-POWER: Enforced golden power management (sleep 0, tcpkeepalive 1, displaysleep 15).")
+    except Exception as e:
+        log(f"enforce_power_management error: {e}")
+
+def main():
+    log("=================================================")
+    log("GPU & System Safeguard Daemon v2.5 (Ultimate Autopilot Edition) started.")
+    log("=================================================")
+    
+    # Global environment variable injections
+    try:
+        subprocess.run(["launchctl", "setenv", "ELECTRON_DISABLE_GPU", "1"], check=False)
+        subprocess.run(["launchctl", "setenv", "LIBVA_DRIVER_NAME", "dummy"], check=False)
+        subprocess.run(["launchctl", "setenv", "CHROME_EXTRA_ARGS", "--disable-gpu --disable-gpu-compositing --disable-webgpu"], check=False)
+        ensure_bluetoothd_healthy()
+        enforce_power_management()
+    except Exception as e:
+        log(f"setenv error: {e}")
+        
+    rollback_any_orig()
+    purge_gpu_caches()
+    scan_all_apps()
+    
+    last_mtimes = {}
+    user_home = get_user_home()
+    watch_dirs = ["/Applications", os.path.join(user_home, "Downloads"), os.path.join(user_home, "Desktop")]
+    last_periodic_check = 0
+    
+    while True:
+        try:
+            now = time.time()
+            needs_scan = False
+            
+            # 1. 监测目录变化 (新建/移动应用)
+            for d in watch_dirs:
+                if os.path.exists(d):
+                    mt = os.stat(d).st_mtime
+                    if mt != last_mtimes.get(d, 0):
+                        last_mtimes[d] = mt
+                        needs_scan = True
+                        
+            # 2. 监测应用内部更新 (各个 .app 自身修改时间变化)
+            for app in glob.glob("/Applications/*.app"):
+                try:
+                    mt = os.stat(app).st_mtime
+                    if mt != last_mtimes.get(app, 0):
+                        last_mtimes[app] = mt
+                        needs_scan = True
+                except:
+                    pass
+                    
+            # 3. 定期心跳兜底 (每 60 秒无论如何快速巡检一次)
+            if now - last_periodic_check > 60:
+                last_periodic_check = now
+                needs_scan = True
+                ensure_bluetoothd_healthy()
+                enforce_power_management()
+                garbage_collect_diagnostic_reports()
+                
+            check_and_hide_efi()
+            if needs_scan:
+                purge_corrupted_icon_caches()
+                scan_all_apps()
+        except Exception as e:
+            log(f"loop error: {e}")
+        time.sleep(5)
+
+if __name__ == "__main__":
+    main()

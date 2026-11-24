@@ -1,0 +1,15 @@
+# OS metadata
+.DS_Store
+*.bin
+
+# Large local backup archives
+EFI_BACKUP_*
+EFI_PM991_FIXED_*
+U盘完整归档备份_*
+rtw88_driver_project/
+
+# Build caches & logs
+*.log
+*.tmp
+build/
+Private_Hardware_Backup/
