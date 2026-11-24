@@ -21,6 +21,10 @@ PURPLE='\033[0;35m'
 RED='\033[0;31m'
 
 USER_HOME="${HOME:-$(eval echo ~$USER)}"
+if [ -z "$USER_HOME" ] || [ "$USER_HOME" = "/" ]; then
+    echo "严重错误：无法识别当前用户主目录，为防止误操作已紧急安全终止！"
+    exit 1
+fi
 
 # 内存读取函数 (GB)
 get_free_ram() {
