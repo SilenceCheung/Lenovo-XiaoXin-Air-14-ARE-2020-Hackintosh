@@ -64,12 +64,11 @@ run_clean_engine() {
     rm -rf "${USER_HOME}/Library/Caches/com.tencent.workbuddy.mac" 2>/dev/null || true
     echo -e "        ${GREEN}✓ 孤立残留配置清理就绪${NC}"
 
-    # 2. 废弃 4K 240FPS 动态视频
-    echo -e "${BLUE}[02/12]${NC} 检索并清理苹果官方废弃 4K 240FPS 动态空中壁纸缓存..."
-    if [ -d "/Library/Application Support/com.apple.idleassetsd/Customer/4KSDR240FPS" ]; then
-        sudo rm -rf "/Library/Application Support/com.apple.idleassetsd/Customer/4KSDR240FPS"/* 2>/dev/null || true
-    fi
-    echo -e "        ${GREEN}✓ 空中视频冗余流清理完成 (根除核显花屏源头)${NC}"
+    # 2. 动态壁纸断点临时碎片 (严格保护已生效壁纸，杜绝误删重置)
+    echo -e "${BLUE}[02/12]${NC} 扫描空中壁纸未完成的断点临时碎片 (严格保护用户已下载壁纸)..."
+    sudo find "/Library/Application Support/com.apple.idleassetsd/Customer" -name "*.download" -type f -delete 2>/dev/null || true
+    sudo find "/Library/Application Support/com.apple.idleassetsd/Customer" -name "*.tmp" -type f -delete 2>/dev/null || true
+    echo -e "        ${GREEN}✓ 壁纸临时断点碎片清理完成 (用户已下载壁纸 100% 完好保留)${NC}"
 
     # 3. 客户端大型更新包与安装包缓存
     echo -e "${BLUE}[03/12]${NC} 清理电商客户端与微软 Office 更新下载安装包..."
